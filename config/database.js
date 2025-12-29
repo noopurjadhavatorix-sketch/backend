@@ -4,7 +4,9 @@ import mongoose from 'mongoose';
 export const connectDB = async () => {
   try {
     if (mongoose.connection.readyState === 0) { // 0 = disconnected
-      await mongoose.connect(process.env.MONGODB_URI, {
+      const uri = process.env.MONGODB_URI || 'mongodb+srv://dmatorixit:atorixitsaperp@cluster0.anmzzu9.mongodb.net/atorix?retryWrites=true&w=majority&appName=Cluster0';
+
+      await mongoose.connect(uri, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
       });
@@ -19,20 +21,14 @@ export const connectDB = async () => {
 
 // Leads database connection
 export const connectLeadsDB = async () => {
-  try {
-    // Use the main connection for now
-    await connectDB();
-    return mongoose.connection;
-  } catch (error) {
-    console.error('Leads database connection error:', error);
-    process.exit(1);
-  }
+  // Using the single connection; alias preserved for compatibility
+  return connectDB();
 };
 
 // Export connections
 export const dbConnections = {
   main: mongoose.connection,
-  leads: mongoose.connection // Using the same connection for now
+  leads: mongoose.connection // Single connection reused
 };
 
 // Handle connection events

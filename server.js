@@ -3,7 +3,8 @@ import dotenv from 'dotenv';
 import express from "express";
 import { createServer } from 'http';
 import mongoose from "mongoose";
-import DemoRequest from './models/DemoRequest.js';
+// We will define the model inline to keep everything in one file as requested
+// import DemoRequest from './models/DemoRequest.js'; 
 import cors from "cors";
 import path from 'path';
 import { promises as fs } from 'fs';
@@ -12,8 +13,16 @@ import bcrypt from "bcrypt";
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
-import Submission from './models/Submission.js';
+// You likely have other imports like Submission.js, websocket.js. 
+// If you want EVERYTHING in one file, you'd need to move those too.
+// For now, I will assume Submission and websocket are external dependencies 
+// that are working fine, and focus on fixing the MongoDB connection/Schema logic for DemoRequest.
+import DemoRequest from './models/DemoRequest.js';
 import { initWebSocket, getWebSocketService } from './services/websocket.js';
+import authRoutes from './routes/auth.js';
+import usersRouter from './routes/users.js';
+import demoRequestsRouter from './routes/demoRequests.js';
+import auditLogsRouter from './routes/auditLogs.js';
 
 // --- ES MODULE __dirname ---
 const __filename = fileURLToPath(import.meta.url);
@@ -22,7 +31,10 @@ const __dirname = dirname(__filename);
 // --- ENV SETUP ---
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-if (!process.env.MONGODB_URI) {
+// Single MongoDB URI for the entire application (dashboard + blog + leads)
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://dmatorixit:atorixitsaperp@cluster0.anmzzu9.mongodb.net/atorix?retryWrites=true&w=majority&appName=Cluster0';
+
+if (!MONGODB_URI) {
   console.error("ERROR: MONGODB_URI environment variable not set.");
   process.exit(1);
 }
@@ -74,62 +86,65 @@ const upload = multer({
 });
 
 // --- CORS ---
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5001',
+  'http://localhost:3001',
+  'https://your-production-frontend-url.com'
+];
+
 const corsOptions = {
-  origin(origin, callback) {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'http://localhost:5001',
-      'http://localhost:3001',
-      'https://your-production-frontend-url.com'
-    ];
-
-    if (
-      process.env.NODE_ENV === 'development' ||
-      allowedOrigins.some(allowedOrigin =>
-        origin === allowedOrigin ||
-        origin.startsWith(allowedOrigin.replace('*', ''))
-      )
-    ) {
+    
+    if (process.env.NODE_ENV === 'development' || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-
-    console.log('CORS blocked for origin:', origin);
-    callback(new Error('Not allowed by CORS'));
+    return callback(new Error('Not allowed by CORS'));
   },
-  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'cache-control'],
   exposedHeaders: ['Content-Disposition'],
+  credentials: true,
   optionsSuccessStatus: 200,
   preflightContinue: false,
-  maxAge: 600
+  maxAge: 86400, // 24 hours
 };
 
+// --- MIDDLEWARE ---
+// CORS
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // preflight
+app.options('*', cors(corsOptions)); // Enable preflight for all routes
 
-// --- BODY PARSERS ---
+// Body parsers with appropriate limits
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-const jsonParser = express.json({ limit: '10mb' });
-const urlencodedParser = express.urlencoded({ extended: true, limit: '10mb' });
-
+// Helper to skip body parsing for multipart/form-data
 const shouldSkipBodyParsing = (req) => {
   const contentType = req.headers['content-type'] || '';
   return contentType.startsWith('multipart/form-data');
 };
 
+// Apply body parsing middleware conditionally
 app.use((req, res, next) => {
-  if (shouldSkipBodyParsing(req)) return next();
-  return jsonParser(req, res, next);
-});
-
-app.use((req, res, next) => {
-  if (shouldSkipBodyParsing(req)) return next();
-  return urlencodedParser(req, res, next);
+  if (shouldSkipBodyParsing(req)) {
+    return next();
+  }
+  
+  // Parse JSON bodies
+  if (req.headers['content-type']?.includes('application/json')) {
+    return express.json({ limit: '50mb' })(req, res, next);
+  }
+  
+  // Parse URL-encoded bodies
+  if (req.headers['content-type']?.includes('application/x-www-form-urlencoded')) {
+    return express.urlencoded({ extended: true, limit: '50mb' })(req, res, next);
+  }
+  
+  // For other content types, continue
+  next();
 });
 
 // --- LOGGING ---
@@ -150,121 +165,59 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
   }
 }));
 
-// --- MONGODB CONNECTIONS ---
+// --- MONGODB CONNECTIONS & SCHEMAS ---
+
+// Define DemoRequest Schema locally (Single source of truth)
+const DemoRequestSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  email: { type: String, required: true, lowercase: true },
+  phone: { type: String, required: true },
+  company: { type: String, required: true },
+  role: { type: String, required: true },
+  interests: { 
+    type: [String], 
+    required: true,
+    validate: {
+      validator: function(v) {
+        return v && v.length > 0;
+      },
+      message: 'At least one interest is required'
+    }
+  },
+  message: String,
+  source: { type: String, default: 'website' },
+  status: { type: String, default: 'new' },
+  metadata: { type: mongoose.Schema.Types.Mixed }
+}, { 
+  timestamps: true,
+  // Explicitly naming the collection ensures both DBs use the same name
+  collection: 'demo_requests' 
+});
+
+
 const connectDB = async () => {
   try {
     console.log('=== Starting MongoDB Connection ===');
     
-    // Connect to main database
-    console.log('Connecting to main MongoDB...');
-    console.log('URI:', process.env.MONGODB_URI.replace(/:[^:@]+@/, ':****@')); // Hide password
+    // Connect to single MongoDB database
+    console.log('Connecting to MongoDB...');
+    console.log('URI:', MONGODB_URI.replace(/:[^:@]+@/, ':****@')); // Hide password
     
-    await mongoose.connect(process.env.MONGODB_URI, {
+    await mongoose.connect(MONGODB_URI, {
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
     });
     
-    console.log('✓ Successfully connected to main MongoDB');
+    console.log('✓ Successfully connected to MongoDB');
     console.log('Main DB Name:', mongoose.connection.db.databaseName);
 
-    // Check if leads MongoDB URI is provided
-    if (!process.env.LEADS_MONGODB_URI) {
-      console.warn('⚠ LEADS_MONGODB_URI not set, using main database for demo requests');
-      
-      // Register DemoRequest model on main connection if not already registered
-      if (!mongoose.models.DemoRequest) {
-        try {
-          // Make sure the model is registered with the correct schema
-          const DemoRequestSchema = DemoRequest.schema || new mongoose.Schema({
-            name: String,
-            email: String,
-            phone: String,
-            company: String,
-            role: String,
-            interests: [String],
-            message: String,
-            source: { type: String, default: 'website' }
-          }, { timestamps: true });
-          
-          mongoose.model('DemoRequest', DemoRequestSchema);
-          console.log('✓ DemoRequest model registered on main database');
-        } catch (modelError) {
-          console.error('Error registering DemoRequest model:', modelError.message);
-        }
-      }
-      
-      return;
+    // Register DemoRequest model on single connection
+    if (!mongoose.models.DemoRequest) {
+      mongoose.model('DemoRequest', DemoRequestSchema);
+      console.log('✓ DemoRequest model registered on MongoDB');
     }
 
-    // Connect to leads database
-    console.log('Connecting to leads MongoDB...');
-    console.log('Leads URI:', process.env.LEADS_MONGODB_URI.replace(/:[^:@]+@/, ':****@'));
-    
-    const leadsConnection = mongoose.createConnection(process.env.LEADS_MONGODB_URI, {
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    });
-
-    // Wait for leads connection
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Leads database connection timeout after 10 seconds'));
-      }, 10000);
-
-      leadsConnection.on('connected', () => {
-        clearTimeout(timeout);
-        console.log('✓ Successfully connected to leads MongoDB');
-        console.log('Leads DB Name:', leadsConnection.db.databaseName);
-        resolve();
-      });
-
-      leadsConnection.on('error', (err) => {
-        clearTimeout(timeout);
-        console.error('❌ Leads MongoDB connection error:', err.message);
-        reject(err);
-      });
-    });
-
-    // Register DemoRequest model on leads connection
-    try {
-      // Define the schema for the leads database
-      const DemoRequestSchema = new mongoose.Schema({
-        name: { type: String, required: true },
-        email: { type: String, required: true, lowercase: true },
-        phone: { type: String, required: true },
-        company: { type: String, required: true },
-        role: { type: String, required: true },
-        interests: { 
-          type: [String], 
-          required: true,
-          validate: {
-            validator: function(v) {
-              return v && v.length > 0;
-            },
-            message: 'At least one interest is required'
-          }
-        },
-        message: String,
-        source: { type: String, default: 'website' },
-        status: { type: String, default: 'new' }
-      }, { 
-        timestamps: true,
-        collection: 'demo_requests' 
-      });
-      
-      // Create the model for the leads database
-      const DemoRequestLeads = leadsConnection.model('DemoRequest', DemoRequestSchema);
-      global.DemoRequestLeads = DemoRequestLeads;
-      
-      console.log('✓ DemoRequest model registered on leads database');
-      console.log('Collection name:', DemoRequestLeads.collection.name);
-    } catch (modelError) {
-      console.error('❌ Error registering DemoRequest model on leads DB:', modelError.message);
-      // Don't throw the error to allow the server to start
-      console.warn('⚠️ Continuing with main database for demo requests');
-    }
-
-    console.log('=== Database Connections Complete ===');
+    console.log('=== Database Connection Complete ===');
 
   } catch (error) {
     console.error('❌ FATAL: Error initializing database connections');
@@ -283,7 +236,15 @@ const connectDB = async () => {
 // Call connectDB
 connectDB();
 
-// --- SCHEMAS & MODELS ---
+// --- ROUTES ---
+app.use('/api/demo-requests', demoRequestsRouter);
+app.use('/api/admin', authRoutes);
+app.use('/api/users', usersRouter);
+app.use('/api/demo-requests', demoRequestsRouter);
+app.use('/api/audit-logs', auditLogsRouter);
+
+
+// --- OTHER SCHEMAS & MODELS ---
 
 // Job Application
 const JobApplicationSchema = new mongoose.Schema({
@@ -302,52 +263,14 @@ const JobApplicationSchema = new mongoose.Schema({
 });
 const JobApplication = mongoose.models.JobApplication || mongoose.model('JobApplication', JobApplicationSchema);
 
-// Old contact user
-const userSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true },
-  email: { type: String, required: true, lowercase: true },
-  phone: { type: String, required: true },
-  company: String,
-  role: String,
-  interestedIn: [String],
-  message: String,
-  createdAt: { type: Date, default: Date.now },
-});
-const User = mongoose.model("User", userSchema);
+// Import User model from models directory
+import User from './models/user.js';
 
-// Admin login account
-const adminSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true, lowercase: true },
-  password: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now }
-});
-const Admin = mongoose.model("Admin", adminSchema);
+// Import Admin model from models directory
+import Admin from './models/Admin.js';
 
-// Admin panel users for /api/users
-const adminUserSchema = new mongoose.Schema(
-  {
-    name: { type: String, required: true, trim: true },
-    email: {
-      type: String,
-      required: true,
-      lowercase: true,
-      unique: true,
-      trim: true,
-    },
-    passwordHash: { type: String, required: true },
-    role: {
-      type: String,
-      enum: ['super_admin', 'hr_mode', 'business_mode'],
-      default: 'super_admin',
-    },
-    location: { type: String, default: '' },
-    color: { type: String, default: '#3B82F6' },
-  },
-  { timestamps: true }
-);
-
-const AdminUser =
-  mongoose.models.AdminUser || mongoose.model('AdminUser', adminUserSchema);
+// Import AdminUser model from models directory
+import AdminUser from './models/AdminUser.js';
 
 // --- BASIC ROUTES ---
 app.get('/api/health', (req, res) => {
@@ -497,7 +420,6 @@ app.get('/api/job-applications', async (req, res) => {
 });
 
 // --- DEMO REQUESTS ---
-// DemoRequest is already imported at the top of the file
 
 app.post('/api/demo-requests', async (req, res) => {
   console.log('=== Demo Request Received ===');
@@ -505,7 +427,6 @@ app.post('/api/demo-requests', async (req, res) => {
   
   // Log database connection state
   console.log('Mongoose connection state:', mongoose.connection.readyState);
-  console.log('Mongoose models:', Object.keys(mongoose.models));
   
   try {
     // Validate required fields
@@ -532,7 +453,7 @@ app.post('/api/demo-requests', async (req, res) => {
     
     console.log('Processed interests:', interestsArray);
     
-    // Prepare the document to save
+    // Prepare the data
     const demoRequestData = {
       name: name.trim(),
       email: email.trim().toLowerCase(),
@@ -550,21 +471,29 @@ app.post('/api/demo-requests', async (req, res) => {
     };
     
     console.log('Attempting to save demo request:', JSON.stringify(demoRequestData, null, 2));
-    
-    // Save to database using the imported model
-    console.log('Creating demo request document...');
-    
-    // Use insertOne directly on the model's collection to avoid any session/transaction issues
-    const result = await mongoose.connection.db.collection('demorequests').insertOne(demoRequestData);
-    
-    if (!result.acknowledged || !result.insertedId) {
-      throw new Error('Failed to save demo request: No acknowledgment from database');
+
+    // determine model (Leads DB vs Main DB)
+    let DemoRequestModel;
+    if (global.DemoRequestLeads) {
+      console.log('Using LEADS database model');
+      DemoRequestModel = global.DemoRequestLeads;
+    } else {
+      console.log('Using MAIN database model');
+      // Ensure model is registered if not using leads db
+      if (mongoose.models.DemoRequest) {
+         DemoRequestModel = mongoose.model('DemoRequest');
+      } else {
+         // Fallback schema registration just in case
+         DemoRequestModel = mongoose.model('DemoRequest', DemoRequestSchema);
+      }
     }
+
+    // Create and save using the Mongoose Model
+    // This ensures validation, timestamps, and correct collection/database usage
+    const newRequest = new DemoRequestModel(demoRequestData);
+    const savedRequest = await newRequest.save();
     
-    console.log('Demo request saved successfully with ID:', result.insertedId);
-    
-    // Get the saved document
-    const savedRequest = await mongoose.connection.db.collection('demorequests').findOne({ _id: result.insertedId });
+    console.log('Demo request saved successfully with ID:', savedRequest._id);
     
     // Try to broadcast via WebSocket if available
     if (getWebSocketService) {
@@ -576,7 +505,6 @@ app.post('/api/demo-requests', async (req, res) => {
         }
       } catch (wsError) {
         console.error('WebSocket broadcast failed (non-fatal):', wsError.message);
-        // Don't fail the request if WebSocket fails
       }
     }
     
@@ -590,27 +518,22 @@ app.post('/api/demo-requests', async (req, res) => {
     console.error('=== DEMO REQUEST ERROR ===');
     console.error('Error:', error.message);
     console.error('Error stack:', error.stack);
-    console.error('Error name:', error.name);
     
     // Check for MongoDB validation errors
     if (error.name === 'ValidationError') {
-      console.error('Validation errors:', error.errors);
       return res.status(400).json({
         success: false,
         message: 'Validation failed: ' + Object.values(error.errors).map(e => e.message).join(', '),
-        error: error.message,
         errors: error.errors
       });
     }
     
     // Check for MongoDB duplicate key error
     if (error.code === 11000) {
-      console.error('Duplicate key error:', error.keyValue);
       return res.status(400).json({
         success: false,
         message: 'Duplicate entry',
-        field: Object.keys(error.keyValue || {})[0],
-        value: Object.values(error.keyValue || {})[0]
+        field: Object.keys(error.keyValue || {})[0]
       });
     }
     
@@ -618,11 +541,7 @@ app.post('/api/demo-requests', async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Failed to process demo request',
-      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
-      ...(process.env.NODE_ENV === 'development' && { 
-        stack: error.stack,
-        errorType: error.name 
-      })
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
 });
@@ -632,40 +551,39 @@ app.post('/api/business-leads', async (req, res) => {
   try {
     const { name, email, phone, company, role, interests, message, source } = req.body;
 
-    const submission = new Submission({
+    const demoRequest = new DemoRequest({
       name,
       email,
       phone,
       company: company || '',
-      role: role || '',
+      role: role || 'Website Visitor',
       interests: Array.isArray(interests) ? interests : [interests].filter(Boolean),
-      message: message || '',
+      message: message || 'No message provided',
       source: source || 'website',
       status: 'new',
       metadata: {
         priority: 'medium',
-        value: 0,
         submittedAt: new Date(),
       },
     });
 
-    const savedSubmission = await submission.save();
+    const savedRequest = await demoRequest.save();
 
     const wsService = getWebSocketService();
     if (wsService) {
-      wsService.broadcast('new_lead', savedSubmission);
+      wsService.broadcastNewDemoRequest(savedRequest);
     }
 
     res.status(201).json({
       success: true,
-      message: 'Form submitted successfully',
-      data: savedSubmission,
+      message: 'Demo request submitted successfully',
+      data: savedRequest,
     });
   } catch (error) {
-    console.error('Error submitting form:', error);
+    console.error('Error submitting demo request:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to submit form',
+      message: 'Failed to submit demo request',
       error: error.message,
     });
   }
@@ -673,17 +591,17 @@ app.post('/api/business-leads', async (req, res) => {
 
 app.get('/api/business-leads', async (req, res) => {
   try {
-    const leads = await Submission.find({}).sort({ createdAt: -1 });
+    const leads = await DemoRequest.find({}).sort({ createdAt: -1 });
     res.status(200).json({
       success: true,
       count: leads.length,
       data: leads,
     });
   } catch (error) {
-    console.error('Error fetching leads:', error);
+    console.error('Error fetching demo requests:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch leads',
+      message: 'Failed to fetch demo requests',
       error: error.message,
     });
   }
@@ -697,39 +615,43 @@ app.post('/api/submit', async (req, res) => {
     if (!name || !email || !phone) {
       return res.status(400).json({
         success: false,
-        message: 'Name, Email, Phone required.',
+        message: 'Name, Email, and Phone are required.',
       });
     }
 
-    const submission = new Submission({
+    const demoRequest = new DemoRequest({
       name,
       email,
       phone,
-      company,
-      role,
-      interests: Array.isArray(interestedIn) ? interestedIn : [interestedIn],
-      message,
+      company: company || 'N/A',
+      role: role || 'Website Visitor',
+      interests: Array.isArray(interestedIn) ? interestedIn : [interestedIn].filter(Boolean),
+      message: message || 'No message provided',
       source: 'website-form',
       status: 'new',
+      metadata: {
+        priority: 'medium',
+        submittedAt: new Date(),
+      },
     });
 
-    const savedSubmission = await submission.save();
+    const savedRequest = await demoRequest.save();
 
-    const wss = getWebSocketService();
-    if (wss && typeof wss.broadcastNewSubmission === 'function') {
-      wss.broadcastNewSubmission(savedSubmission);
+    const wsService = getWebSocketService();
+    if (wsService) {
+      wsService.broadcastNewDemoRequest(savedRequest);
     }
 
     res.status(201).json({
       success: true,
-      message: 'Submitted successfully!',
-      data: savedSubmission,
+      message: 'Demo request submitted successfully!',
+      data: savedRequest,
     });
   } catch (error) {
-    console.error('Error submitting form:', error);
+    console.error('Error submitting demo request:', error);
     res.status(500).json({
       success: false,
-      message: 'Submission failed',
+      message: 'Failed to submit demo request',
       error: error.message,
     });
   }
@@ -766,29 +688,100 @@ async function initializeAdmin() {
 }
 initializeAdmin();
 
-// --- GET DEMO REQUESTS ---
-app.get('/api/demo-requests', async (req, res) => {
+// --- GET DEMO REQUESTS COUNT ---
+app.get('/api/demo-requests/count', async (req, res) => {
   try {
     let requests;
     
+    // --- CORRECTED LOGIC TO MATCH POST ROUTE ---
     if (global.DemoRequestLeads) {
-      requests = await global.DemoRequestLeads.find().sort({ createdAt: -1 }).limit(50);
+      requests = await global.DemoRequestLeads.find().select('status');
     } else {
-      const DemoRequestMain = mongoose.model('DemoRequest');
-      requests = await DemoRequestMain.find().sort({ createdAt: -1 }).limit(50);
+      // ensure model is registered
+      const DemoRequestMain = mongoose.models.DemoRequest || mongoose.model('DemoRequest', DemoRequestSchema);
+      requests = await DemoRequestMain.find().select('status');
     }
-    
-    res.json({ 
-      success: true, 
-      count: requests.length,
-      data: requests 
+
+    // Calculate counts
+    const total = requests.length;
+    const newCount = requests.filter(lead => !lead.status || lead.status === 'new').length;
+    const contactedCount = requests.filter(lead => lead.status === 'contacted').length;
+    const qualifiedCount = requests.filter(lead => lead.status === 'qualified').length;
+
+    res.json({
+      success: true,
+      count: total,
+      newCount,
+      contactedCount,
+      qualifiedCount
     });
   } catch (error) {
-    console.error('Error fetching demo requests:', error);
+    console.error('Error getting demo request counts:', error);
     res.status(500).json({ 
       success: false, 
-      message: 'Failed to fetch demo requests',
-      error: error.message 
+      message: 'Error fetching demo request counts',
+      count: 0,
+      newCount: 0,
+      contactedCount: 0,
+      qualifiedCount: 0
+    });
+  }
+});
+
+// --- GET DEMO REQUESTS ---
+app.get('/api/demo-requests', async (req, res) => {
+  console.log('Fetching demo requests...');
+  try {
+    // Check database connection
+    if (mongoose.connection.readyState !== 1) {
+      console.error('Database not connected!');
+      return res.status(500).json({
+        success: false,
+        message: 'Database connection error',
+        data: []
+      });
+    }
+
+    let requests = [];
+    
+    try {
+      // --- CORRECTED LOGIC TO MATCH POST ROUTE ---
+      if (global.DemoRequestLeads) {
+        requests = await global.DemoRequestLeads.find()
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .lean();
+      } else {
+        const DemoRequestMain = mongoose.models.DemoRequest || mongoose.model('DemoRequest', DemoRequestSchema);
+        requests = await DemoRequestMain.find()
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .lean();
+      }
+      
+      console.log(`Found ${requests.length} demo requests`);
+      
+      return res.json({ 
+        success: true, 
+        count: requests.length,
+        data: requests 
+      });
+    } catch (dbError) {
+      console.error('Database query error:', dbError);
+      return res.status(500).json({
+        success: false,
+        message: 'Database query error',
+        error: dbError.message,
+        data: []
+      });
+    }
+  } catch (error) {
+    console.error('Error in /api/demo-requests:', error);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error while fetching demo requests',
+      error: error.message,
+      data: []
     });
   }
 });

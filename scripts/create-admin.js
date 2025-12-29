@@ -69,8 +69,8 @@ const adminSchema = new mongoose.Schema({
 // Connect to MongoDB
 async function createAdmin() {
   try {
-    // Get MongoDB connection string from environment variable
-    const mongoUri = process.env.MONGODB_URI;
+    // Get MongoDB connection string from environment variable (single DB)
+    const mongoUri = process.env.MONGODB_URI || 'mongodb+srv://dmatorixit:atorixitsaperp@cluster0.anmzzu9.mongodb.net/atorix?retryWrites=true&w=majority&appName=Cluster0';
 
     if (!mongoUri) {
       console.error('Error: MONGODB_URI environment variable not set.');

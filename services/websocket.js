@@ -1,5 +1,5 @@
 import { WebSocket, WebSocketServer } from 'ws';
-import Submission from '../models/Submission.js';
+import DemoRequest from '../models/DemoRequest.js';
 
 // Store connected clients
 
@@ -27,12 +27,12 @@ class WebSocketService {
     });
   }
 
-  broadcastNewSubmission(submission) {
+  broadcastNewDemoRequest(demoRequest) {
     if (!this.clients || this.clients.size === 0) return;
     
     const message = JSON.stringify({
-      type: 'NEW_SUBMISSION',
-      data: submission
+      type: 'NEW_DEMO_REQUEST',
+      data: demoRequest
     });
 
     this.clients.forEach((client) => {
@@ -46,10 +46,10 @@ class WebSocketService {
     });
   }
 
-  broadcastUpdate(submission) {
+  broadcastUpdate(demoRequest) {
     const message = JSON.stringify({
-      type: 'UPDATE_SUBMISSION',
-      data: submission
+      type: 'UPDATE_DEMO_REQUEST',
+      data: demoRequest
     });
 
     this.clients.forEach((client) => {
@@ -61,7 +61,7 @@ class WebSocketService {
 
   broadcastDelete(id) {
     const message = JSON.stringify({
-      type: 'DELETE_SUBMISSION',
+      type: 'DELETE_DEMO_REQUEST',
       data: { _id: id }
     });
 

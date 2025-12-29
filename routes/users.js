@@ -1,14 +1,24 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
-import User from '../models/user.js';
+import AdminUser from '../models/AdminUser.js';
 
 const router = express.Router();
+
+// Middleware to ensure JSON content type for specific routes
+const requireJsonContent = (req, res, next) => {
+  if (req.headers['content-type'] !== 'application/json') {
+    return res.status(400).json({ 
+      message: 'Content-Type must be application/json' 
+    });
+  }
+  next();
+};
 
 // Get all users
 router.get('/', async (req, res) => {
   try {
     console.log('GET /api/users - Fetching all users');
-    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    const users = await AdminUser.find().select('-passwordHash').sort({ createdAt: -1 });
     console.log(`Found ${users.length} users`);
     res.status(200).json(users);
   } catch (error) {
@@ -21,7 +31,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     console.log(`GET /api/users/${req.params.id}`);
-    const user = await User.findById(req.params.id).select('-password');
+    const user = await AdminUser.findById(req.params.id).select('-passwordHash');
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -33,17 +43,29 @@ router.get('/:id', async (req, res) => {
 });
 
 // Create new user
-router.post('/', async (req, res) => {
+router.post('/', requireJsonContent, async (req, res) => {
   try {
     console.log('POST /api/users - Creating new user');
-    console.log('Request body:', req.body);
+    console.log('Request headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
     
     const { name, email, password, role, location, color, isActive } = req.body;
 
-    // Validation
-    if (!name || !email || !password) {
-      console.log('Validation failed: missing required fields');
-      return res.status(400).json({ message: 'Name, email, and password are required' });
+    // Enhanced validation with detailed error messages
+    const missingFields = [];
+    if (!name) missingFields.push('name');
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+
+    if (missingFields.length > 0) {
+      const errorMsg = `Missing required fields: ${missingFields.join(', ')}`;
+      console.log('Validation failed:', errorMsg);
+      return res.status(400).json({ 
+        success: false,
+        message: errorMsg,
+        missingFields,
+        receivedData: { name: !!name, email: !!email, password: '***' }
+      });
     }
 
     if (password.length < 6) {
@@ -52,7 +74,9 @@ router.post('/', async (req, res) => {
     }
 
     // Check if email already exists
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    console.log('Checking for existing user with email:', email.toLowerCase());
+    const existingUser = await AdminUser.findOne({ email: email.toLowerCase() });
+    console.log('Existing user check result:', existingUser ? 'Found' : 'Not found');
     if (existingUser) {
       console.log('Email already exists:', email);
       return res.status(400).json({ message: 'Email already exists' });
@@ -60,14 +84,14 @@ router.post('/', async (req, res) => {
 
     // Hash password
     console.log('Hashing password...');
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(password, 10);
 
-    // Create new user
-    const newUser = new User({
+    // Create new admin user
+    const newUser = new AdminUser({
       name: name.trim(),
       email: email.trim().toLowerCase(),
-      password: hashedPassword,
-      role: role || 'user',
+      passwordHash,
+      role: role || 'business_mode',
       location: location || '',
       color: color || '#3B82F6',
       isActive: isActive !== undefined ? isActive : true
@@ -75,16 +99,59 @@ router.post('/', async (req, res) => {
 
     console.log('Saving user to database...');
     const savedUser = await newUser.save();
-    console.log('User saved successfully:', savedUser._id);
+    console.log('User saved successfully:', { 
+      id: savedUser._id, 
+      email: savedUser.email,
+      role: savedUser.role 
+    });
 
-    // Return user without password
+    // Return user without password hash
     const userResponse = savedUser.toObject();
-    delete userResponse.password;
+    delete userResponse.passwordHash;
 
-    res.status(201).json(userResponse);
+    res.status(201).json({
+      success: true,
+      message: 'User created successfully',
+      data: userResponse
+    });
   } catch (error) {
-    console.error('Error creating user:', error);
-    res.status(500).json({ message: 'Failed to create user', error: error.message });
+    console.error('Error creating user:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      ...(error.errors && { errors: error.errors })
+    });
+    
+    // Handle duplicate key errors specifically (e.g., unique email)
+    if (error.name === 'MongoServerError' && error.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email already exists',
+        field: 'email',
+        error: error.message
+      });
+    }
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      const errors = {};
+      Object.keys(error.errors).forEach(key => {
+        errors[key] = error.errors[key].message;
+      });
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors
+      });
+    }
+    
+    // Generic error response
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create user',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+      ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
+    });
   }
 });
 
@@ -98,7 +165,7 @@ router.put('/:id', async (req, res) => {
     const userId = req.params.id;
 
     // Find user
-    const user = await User.findById(userId);
+    const user = await AdminUser.findById(userId);
     if (!user) {
       console.log('User not found:', userId);
       return res.status(404).json({ message: 'User not found' });
@@ -106,7 +173,7 @@ router.put('/:id', async (req, res) => {
 
     // Check if email is being changed and if it already exists
     if (email && email.toLowerCase() !== user.email) {
-      const existingUser = await User.findOne({ 
+      const existingUser = await AdminUser.findOne({ 
         email: email.toLowerCase(),
         _id: { $ne: userId }
       });
@@ -130,7 +197,7 @@ router.put('/:id', async (req, res) => {
         return res.status(400).json({ message: 'Password must be at least 6 characters' });
       }
       console.log('Updating password...');
-      user.password = await bcrypt.hash(password, 10);
+      user.passwordHash = await bcrypt.hash(password, 10);
     }
 
     user.updatedAt = Date.now();
@@ -141,7 +208,7 @@ router.put('/:id', async (req, res) => {
 
     // Return user without password
     const userResponse = updatedUser.toObject();
-    delete userResponse.password;
+    delete userResponse.passwordHash;
 
     res.status(200).json(userResponse);
   } catch (error) {
@@ -156,7 +223,7 @@ router.delete('/:id', async (req, res) => {
     console.log(`DELETE /api/users/${req.params.id}`);
     const userId = req.params.id;
 
-    const deletedUser = await User.findByIdAndDelete(userId);
+    const deletedUser = await AdminUser.findByIdAndDelete(userId);
     
     if (!deletedUser) {
       console.log('User not found:', userId);
